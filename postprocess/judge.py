@@ -1,3 +1,4 @@
+import os
 import sys
 sys.path.insert(0, 'causal-learn')
 
@@ -58,6 +59,12 @@ class Judge(object):
         # Statistics Perspective: Bootstrapping to get probability of edges using the selected algorithm.
         edge_recom, boot_probability = bootstrap(data=data, full_graph=full_graph, algorithm=algorithm, hyperparameters=hyperparameters,
                                                   boot_num=boot_num, ts=False, parallel=self.args.parallel)
+
+        # BLD-06 (cc-research): refinement v2 replaces the pruning stages below. CC_REFINEMENT=original restores them;
+        # CC_REFINEMENT=v2d runs v2's data part only (no model call).
+        mode = os.environ.get("CC_REFINEMENT", "v2")
+        if mode in ("v2", "v2d"):
+            return self._refine_v2(data, full_graph, boot_probability, mode)
         #print("Edge Recommendations from Bootstrap method: ", edge_recom)
         #print("Bootstrap Probability: ", boot_probability)
 
@@ -129,6 +136,32 @@ class Judge(object):
 
         return {}, bootstrap_check_dict, boot_probability, llm_pruning_record, revised_graph, bk
 
+
+    def _refine_v2(self, data, full_graph, boot_probability, mode):
+        from postprocess.judge_functions import bootstrap_recommend
+        from postprocess.refinement_v2_dropin import refine
+        import numpy as np
+        from causallearn.utils.PCUtils.BackgroundKnowledge import BackgroundKnowledge
+        names = list(data.columns)
+        ask = None
+        if mode == "v2":
+            client = LLMClient(self.args)
+
+            def ask(prompt):
+                return client.chat_completion(prompt=prompt, system_prompt="You are a helpful assistant.", json_response=True)
+        logger.process("Refinement v2 (%s): data part, then names only where the data leave a pair undirected" % mode)
+        revised_graph, record = refine(np.asarray(full_graph), boot_probability, names, ask)
+        bk = BackgroundKnowledge()
+        direct = {}
+        for rec in record["names"]:
+            if rec.get("used"):
+                a, b = rec["pair"]
+                cause, effect = (a, b) if rec["direction"] == "a->b" else (b, a)
+                direct[(cause, effect)] = ((names[cause], names[effect]), "names: three paraphrases agree (refinement v2)")
+                bk.add_required_by_pattern(names[cause], names[effect])
+        llm_pruning_record = {'direct_record': direct, 'forbid_record': {}, 'refinement_v2': record}
+        bootstrap_check_dict = bootstrap_recommend(full_graph, boot_probability)
+        return {}, bootstrap_check_dict, boot_probability, llm_pruning_record, revised_graph, bk
 
     def forward(self, global_state, prompt_type, voting_num):
         adj_matrix = global_state.results.converted_graph
